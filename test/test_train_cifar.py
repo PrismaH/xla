@@ -6,7 +6,7 @@ FLAGS = test_utils.parse_common_options(
     num_epochs=20,
     momentum=0.9,
     lr=0.2,
-    target_accuracy=80.0)
+    target_accuracy=95.0)
 
 from common_utils import TestCase, run_tests
 import shutil
@@ -22,74 +22,139 @@ import torchvision
 import torchvision.transforms as transforms
 import unittest
 
+class shortcut(nn.Module):
+    def __init__(self, add_ch, stride=1):
+        super(shortcut, self).__init__()
+        #should use nn.Identity() but causes error on some environment
+        self.pooling = nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=False) if stride == 2 else lambda x: x
+        self.pad = (0, 0, 0, 0, 0, add_ch)
+        
+    def forward(self, x):
+        return self.pooling(F.pad(x, self.pad))
 
-class BasicBlock(nn.Module):
-  expansion = 1
+#basic block of pyramidnet
+class Basicblock(nn.Module): 
 
-  def __init__(self, in_planes, planes, stride=1):
-    super(BasicBlock, self).__init__()
-    self.conv1 = nn.Conv2d(
-        in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-    self.bn1 = nn.BatchNorm2d(planes)
-    self.conv2 = nn.Conv2d(
-        planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-    self.bn2 = nn.BatchNorm2d(planes)
+    def __init__(self, input_ch, output_ch, stride=1):
+        super(Basicblock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(input_ch)
+        self.conv1 = nn.Conv2d(input_ch, output_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(output_ch)
+        self.conv2 = nn.Conv2d(output_ch, output_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(output_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.down_sample = shortcut(output_ch - input_ch, stride)
 
-    self.shortcut = nn.Sequential()
-    if stride != 1 or in_planes != self.expansion * planes:
-      self.shortcut = nn.Sequential(
-          nn.Conv2d(
-              in_planes,
-              self.expansion * planes,
-              kernel_size=1,
-              stride=stride,
-              bias=False), nn.BatchNorm2d(self.expansion * planes))
+    def forward(self, x):
+        shortcut = self.down_sample(x)
+        x = self.bn1(x)
+        x = self.conv1(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn3(x)
 
-  def forward(self, x):
-    out = F.relu(self.bn1(self.conv1(x)))
-    out = self.bn2(self.conv2(out))
-    out += self.shortcut(x)
-    out = F.relu(out)
-    return out
+        return x + shortcut
 
+class Bottleneckblock(nn.Module):
+    outchannel_ratio = 4
+    reduction = 16
 
-class ResNet(nn.Module):
+    def __init__(self, input_ch, output_ch, stride=1):
+        super(Bottleneckblock, self).__init__()
+        self.bn1 = nn.BatchNorm2d(input_ch)
+        self.conv1 = nn.Conv2d(input_ch, output_ch, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn2 = nn.BatchNorm2d(output_ch)
+        self.conv2 = nn.Conv2d(output_ch, output_ch, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(output_ch)
+        self.conv3 = nn.Conv2d(output_ch, output_ch * Bottleneckblock.outchannel_ratio, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn4 = nn.BatchNorm2d(output_ch * Bottleneckblock.outchannel_ratio)
+        self.relu = nn.ReLU(inplace=True)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.sigmoid = nn.Sigmoid()
+        self.downconv = nn.Conv2d(output_ch * Bottleneckblock.outchannel_ratio, output_ch * Bottleneckblock.outchannel_ratio // Bottleneckblock.reduction, kernel_size=1, bias=False)
+        self.upconv = nn.Conv2d(output_ch * Bottleneckblock.outchannel_ratio // Bottleneckblock.reduction, output_ch * Bottleneckblock.outchannel_ratio, kernel_size=1, bias=False)
+        self.down_sample = shortcut(output_ch * Bottleneckblock.outchannel_ratio - input_ch, stride)
 
-  def __init__(self, block, num_blocks, num_classes=10):
-    super(ResNet, self).__init__()
-    self.in_planes = 64
+    def forward(self, x):
+        shortcut = self.down_sample(x)
 
-    self.conv1 = nn.Conv2d(
-        3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    self.bn1 = nn.BatchNorm2d(64)
-    self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-    self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-    self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-    self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-    self.linear = nn.Linear(512 * block.expansion, num_classes)
+        x = self.bn1(x)
+        x = self.conv1(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+        x = self.conv3(x)
+        x = self.bn4(x)
 
-  def _make_layer(self, block, planes, num_blocks, stride):
-    strides = [stride] + [1] * (num_blocks - 1)
-    layers = []
-    for stride in strides:
-      layers.append(block(self.in_planes, planes, stride))
-      self.in_planes = planes * block.expansion
-    return nn.Sequential(*layers)
+        y = self.global_pool(x)
+        y = self.downconv(y)
+        y = self.relu(y)
+        y = self.upconv(y)
+        y = self.sigmoid(y)
 
-  def forward(self, x):
-    out = F.relu(self.bn1(self.conv1(x)))
-    out = self.layer1(out)
-    out = self.layer2(out)
-    out = self.layer3(out)
-    out = self.layer4(out)
-    out = F.avg_pool2d(out, 4)
-    out = out.view(out.size(0), -1)
-    out = self.linear(out)
-    return F.log_softmax(out, dim=1)
+        x = x * y
 
+        return x + shortcut
 
+class SEPyramidNet(nn.Module): #Constructing PyramidNet
+    def __init__(self, block_type, num_res, alpha, input_ch, classes_num):
+        super(SEPyramidNet, self).__init__()
+        self.in_channels = 16
+        self.num_res = num_res
+        self.addrate = alpha / (num_res * 3)
+
+        self.conv1 = nn.Conv2d(in_channels=input_ch, out_channels=16, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+
+        self.layer1 = self.layer_define(block_type, stride = 1)
+        self.layer2 = self.layer_define(block_type, stride = 2)
+        self.layer3 = self.layer_define(block_type, stride = 2)
+
+        self.output_ch = round(self.output_ch)
+
+        self.bn2 = nn.BatchNorm2d(self.output_ch)
+        
+        self.relu = nn.ReLU(inplace=True)
+
+        self.linear1 = nn.Linear(self.output_ch, classes_num)
+        
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', 
+                                        nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def layer_define(self, block_type, stride):
+        layers_list = []
+        for _ in range(self.num_res - 1):
+            self.output_ch = self.in_channels + self.addrate
+            layers_list.append(block_type(int(round(self.in_channels)), int(round(self.output_ch)), stride=stride))
+            self.in_channels = self.output_ch
+            stride = 1
+ 
+        return nn.Sequential(*layers_list)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = F.adaptive_avg_pool2d(x, 1)
+
+        return self.linear1(x.view(x.size(0), -1))
+   
 def ResNet18():
-  return ResNet(BasicBlock, [2, 2, 2, 2])
+  return SEPyramidNet(Basicblock, 18, 48, 3, 10)
 
 
 def train_cifar():
